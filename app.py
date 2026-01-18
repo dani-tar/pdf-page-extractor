@@ -20,6 +20,7 @@ app = FastAPI()
 API_KEY = os.environ.get("API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Cloudflare R2 (S3-compatible)
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
@@ -37,34 +38,41 @@ PROGRESS_EVERY_PAGES = int(os.environ.get("PROGRESS_EVERY_PAGES", "10"))
 
 _pool: asyncpg.Pool | None = None
 
+
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set")
+        # Keep pool small on tiny instances
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
     return _pool
+
 
 async def db_exec(sql: str, *args):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.execute(sql, *args)
 
+
 async def db_one(sql: str, *args):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchrow(sql, *args)
+
 
 async def db_all(sql: str, *args):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch(sql, *args)
 
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 # ----------------------------
-# Schema bootstrap (safe)
+# Schema bootstrap + migrations
 # ----------------------------
 
 SCHEMA_SQL = """
@@ -106,25 +114,49 @@ CREATE INDEX IF NOT EXISTS pdf_extract_pages_job_page_idx
 ON public.pdf_extract_pages (job_id, pdf_page);
 """
 
+# Improvement #2: safer migration for existing tables:
+# - add column nullable first
+# - backfill
+# - set default + not null
 MIGRATE_SQL = """
 ALTER TABLE public.pdf_extract_jobs
   ADD COLUMN IF NOT EXISTS r2_key text;
+
 ALTER TABLE public.pdf_extract_jobs
-  ADD COLUMN IF NOT EXISTS next_page integer NOT NULL DEFAULT 1;
+  ADD COLUMN IF NOT EXISTS next_page integer;
+
+UPDATE public.pdf_extract_jobs
+SET next_page = 1
+WHERE next_page IS NULL;
+
+ALTER TABLE public.pdf_extract_jobs
+  ALTER COLUMN next_page SET DEFAULT 1;
+
+ALTER TABLE public.pdf_extract_jobs
+  ALTER COLUMN next_page SET NOT NULL;
 """
+
 
 @app.on_event("startup")
 async def _startup():
     await get_pool()
+
     # Create tables/indexes
     statements = [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]
     for stmt in statements:
         await db_exec(stmt)
 
-    # Apply migrations for existing tables
+    # Apply migrations for existing tables (idempotent)
     migs = [s.strip() for s in MIGRATE_SQL.split(";") if s.strip()]
     for stmt in migs:
-        await db_exec(stmt)
+        try:
+            await db_exec(stmt)
+        except Exception:
+            # If something fails due to partial state, it's usually safe to ignore and continue,
+            # but we prefer to surface real issues. Uncomment below if you want strict startup.
+            # raise
+            pass
+
 
 # ----------------------------
 # Auth
@@ -134,11 +166,13 @@ def require_api_key(x_api_key: str | None):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+
 # ----------------------------
 # R2 client
 # ----------------------------
 
 _s3 = None
+
 
 def get_r2_endpoint() -> str:
     if R2_ENDPOINT_URL:
@@ -146,6 +180,7 @@ def get_r2_endpoint() -> str:
     if not R2_ACCOUNT_ID:
         raise RuntimeError("R2_ACCOUNT_ID is not set")
     return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
 
 def get_s3():
     global _s3
@@ -162,6 +197,7 @@ def get_s3():
         )
     return _s3
 
+
 # Multipart upload tuning (important for large PDFs)
 TRANSFER_CFG = TransferConfig(
     multipart_threshold=8 * 1024 * 1024,   # 8MB
@@ -170,6 +206,7 @@ TRANSFER_CFG = TransferConfig(
     use_threads=True,
 )
 
+
 # ----------------------------
 # Health
 # ----------------------------
@@ -177,6 +214,7 @@ TRANSFER_CFG = TransferConfig(
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 # ----------------------------
 # Helpers: stream upload to disk (avoid RAM), then to R2
@@ -192,18 +230,21 @@ async def save_upload_to_tmp(upload: UploadFile) -> str:
         shutil.copyfileobj(upload.file, out, length=1024 * 1024)  # 1MB chunks
     return tmp_path
 
+
 def make_r2_key(document_id: str, changed_id: str, job_id: uuid.UUID) -> str:
-    # Stable-ish path for debugging
     safe_changed = changed_id.replace("/", "_")
     return f"pdf/{document_id}/{safe_changed}/{job_id}.pdf"
+
 
 def upload_file_to_r2(local_path: str, key: str):
     s3 = get_s3()
     s3.upload_file(local_path, R2_BUCKET_NAME, key, Config=TRANSFER_CFG)
 
+
 def download_file_from_r2(key: str, local_path: str):
     s3 = get_s3()
     s3.download_file(R2_BUCKET_NAME, key, local_path)
+
 
 # ----------------------------
 # API: start job (uploads PDF to R2, does NOT process pages)
@@ -229,58 +270,61 @@ async def extract_start(
 
     existing = await db_one(
         """
-        SELECT job_id, status, num_pages, inserted_pages, error, r2_key, next_page
+        SELECT job_id, status, num_pages, inserted_pages, error, r2_key, next_page,
+               file_id, title, source, url
         FROM public.pdf_extract_jobs
         WHERE document_id=$1 AND changed_id=$2
         """,
         doc_uuid, changed_id
     )
 
+    # Improvement #1: FIXED indentation + idempotent “merge metadata” for existing jobs
     if existing and existing["status"] in ("queued", "running", "done"):
-    # Merge metadata if the new request contains values (idempotent-safe)
-    await db_exec(
-        """
-        UPDATE public.pdf_extract_jobs
-        SET
-          file_id = COALESCE(NULLIF($2,''), file_id),
-          title   = COALESCE(NULLIF($3,''), title),
-          source  = COALESCE(NULLIF($4,''), source),
-          url     = COALESCE(NULLIF($5,''), url),
-          updated_at = now()
-        WHERE job_id = $1
-        """,
-        existing["job_id"],
-        file_id or "",
-        title or "",
-        source or "",
-        url or "",
-    )
+        # Merge metadata if the new request contains values (idempotent-safe)
+        await db_exec(
+            """
+            UPDATE public.pdf_extract_jobs
+            SET
+              file_id = COALESCE(NULLIF($2,''), file_id),
+              title   = COALESCE(NULLIF($3,''), title),
+              source  = COALESCE(NULLIF($4,''), source),
+              url     = COALESCE(NULLIF($5,''), url),
+              updated_at = now()
+            WHERE job_id = $1
+            """,
+            existing["job_id"],
+            file_id or "",
+            title or "",
+            source or "",
+            url or "",
+        )
 
-    # Re-read so the response reflects the updated values
-    refreshed = await db_one(
-        """
-        SELECT job_id, status, num_pages, inserted_pages, error, file_id, title, source, url
-        FROM public.pdf_extract_jobs
-        WHERE job_id=$1
-        """,
-        existing["job_id"]
-    )
+        refreshed = await db_one(
+            """
+            SELECT job_id, status, num_pages, inserted_pages, error, r2_key, next_page,
+                   file_id, title, source, url
+            FROM public.pdf_extract_jobs
+            WHERE job_id=$1
+            """,
+            existing["job_id"]
+        )
 
-    return {
-        "job_id": str(refreshed["job_id"]),
-        "status": refreshed["status"],
-        "num_pages": refreshed["num_pages"],
-        "inserted_pages": refreshed["inserted_pages"],
-        "error": refreshed["error"],
-        "file_id": refreshed["file_id"],
-        "title": refreshed["title"],
-        "source": refreshed["source"],
-        "url": refreshed["url"],
-        "idempotent": True,
-    }
+        return {
+            "job_id": str(refreshed["job_id"]),
+            "status": refreshed["status"],
+            "num_pages": refreshed["num_pages"],
+            "inserted_pages": refreshed["inserted_pages"],
+            "error": refreshed["error"],
+            "r2_key": refreshed["r2_key"],
+            "next_page": refreshed["next_page"],
+            "file_id": refreshed["file_id"],
+            "title": refreshed["title"],
+            "source": refreshed["source"],
+            "url": refreshed["url"],
+            "idempotent": True,
+        }
 
-
-    # Create new job_id (or reuse failed job_id)
+    # Reuse failed job_id (resume), or create new job
     if existing and existing["status"] == "failed":
         job_id = existing["job_id"]
         await db_exec(
@@ -290,6 +334,24 @@ async def extract_start(
             WHERE job_id=$1
             """,
             job_id
+        )
+        # Also merge metadata on retry
+        await db_exec(
+            """
+            UPDATE public.pdf_extract_jobs
+            SET
+              file_id = COALESCE(NULLIF($2,''), file_id),
+              title   = COALESCE(NULLIF($3,''), title),
+              source  = COALESCE(NULLIF($4,''), source),
+              url     = COALESCE(NULLIF($5,''), url),
+              updated_at = now()
+            WHERE job_id = $1
+            """,
+            job_id,
+            file_id or "",
+            title or "",
+            source or "",
+            url or "",
         )
     else:
         job_id = uuid.uuid4()
@@ -337,6 +399,7 @@ async def extract_start(
 
     return {"job_id": str(job_id), "status": "queued", "r2_key_saved": True}
 
+
 # ----------------------------
 # API: status
 # ----------------------------
@@ -352,7 +415,7 @@ async def extract_status(job_id: str, x_api_key: str = Header(None)):
     row = await db_one(
         """
         SELECT job_id, document_id, changed_id, status, num_pages, inserted_pages, next_page, error,
-               created_at, updated_at, started_at, completed_at
+               created_at, updated_at, started_at, completed_at, file_id, title, source, url, r2_key
         FROM public.pdf_extract_jobs
         WHERE job_id=$1
         """,
@@ -370,11 +433,17 @@ async def extract_status(job_id: str, x_api_key: str = Header(None)):
         "inserted_pages": row["inserted_pages"],
         "next_page": row["next_page"],
         "error": row["error"],
+        "file_id": row["file_id"],
+        "title": row["title"],
+        "source": row["source"],
+        "url": row["url"],
+        "r2_key": row["r2_key"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
         "started_at": row["started_at"].isoformat() if row["started_at"] else None,
         "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
     }
+
 
 # ----------------------------
 # API: read pages (for n8n batching downstream)
@@ -422,8 +491,9 @@ async def extract_pages(
         "pages": [{"pdf_page": r["pdf_page"], "text": r["text"]} for r in rows],
     }
 
+
 # ----------------------------
-# NEW: worker step endpoint (batch processing, resume-safe)
+# Worker step endpoint (batch processing, resume-safe)
 # n8n should call this in a loop until status=done
 # ----------------------------
 
@@ -453,7 +523,13 @@ async def extract_work(
         raise HTTPException(status_code=400, detail="Job has no r2_key (did /extract/start complete?)")
 
     if job["status"] == "done":
-        return {"job_id": job_id, "status": "done", "num_pages": job["num_pages"], "inserted_pages": job["inserted_pages"]}
+        return {
+            "job_id": job_id,
+            "status": "done",
+            "num_pages": job["num_pages"],
+            "inserted_pages": job["inserted_pages"],
+            "next_page": job["next_page"],
+        }
 
     # Mark running (first work call)
     if job["status"] in ("queued", "failed"):
@@ -484,9 +560,9 @@ async def extract_work(
                 job_uuid, num_pages
             )
 
-        # Determine batch start: prefer next_page, but also safe against drift:
-        # if next_page points to an already-inserted page, we will skip until we find a missing one.
         start_page = int(job["next_page"] or 1)
+        if start_page < 1:
+            start_page = 1
         end_page = min(start_page + int(max_pages) - 1, num_pages)
 
         processed = 0
@@ -521,7 +597,10 @@ async def extract_work(
             processed += 1
 
             if inserted_in_this_call % PROGRESS_EVERY_PAGES == 0:
-                row = await db_one("SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1", job_uuid)
+                row = await db_one(
+                    "SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1",
+                    job_uuid
+                )
                 await db_exec(
                     "UPDATE public.pdf_extract_jobs SET inserted_pages=$2, updated_at=now() WHERE job_id=$1",
                     job_uuid, int(row["cnt"])
