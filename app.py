@@ -1,17 +1,20 @@
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, BackgroundTasks, Form, Query
-from fastapi.responses import JSONResponse
-import pdfplumber
-import io
+import asyncpg
 import os
 import uuid
 import asyncio
-import asyncpg
 from datetime import datetime, timezone
+from pathlib import Path
+import tempfile
+import shutil
+
+import pypdfium2 as pdfium
+
 
 app = FastAPI()
 
 API_KEY = os.environ.get("API_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string, e.g. postgres://...
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Neon connection string
 
 # ----------------------------
 # DB helpers
@@ -24,7 +27,8 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        # Keep pool small on tiny instances
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
     return _pool
 
 async def db_exec(sql: str, *args):
@@ -85,10 +89,7 @@ ON public.pdf_extract_pages (job_id, pdf_page);
 
 @app.on_event("startup")
 async def _startup():
-    # Create pool + ensure tables exist
     await get_pool()
-    # asyncpg doesn't support multiple statements in one execute reliably depending on settings.
-    # We'll split on semicolons safely for this small bootstrap.
     statements = [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]
     for stmt in statements:
         await db_exec(stmt)
@@ -110,7 +111,27 @@ def health():
     return {"ok": True}
 
 # ----------------------------
-# B2: Job-based extraction
+# Helpers: store upload to disk (avoid RAM blowups)
+# ----------------------------
+
+async def save_upload_to_tmp(upload: UploadFile) -> str:
+    """
+    Streams UploadFile to a temp file on disk and returns the path.
+    Avoids keeping the whole PDF in memory.
+    """
+    tmp_dir = Path(tempfile.gettempdir())
+    fd, tmp_path = tempfile.mkstemp(prefix="pdf_", suffix=".pdf", dir=str(tmp_dir))
+    os.close(fd)
+
+    # Stream-copy in chunks
+    upload.file.seek(0)
+    with open(tmp_path, "wb") as out:
+        shutil.copyfileobj(upload.file, out, length=1024 * 1024)  # 1MB chunks
+
+    return tmp_path
+
+# ----------------------------
+# API: Job-based extraction
 # ----------------------------
 
 @app.post("/extract/start")
@@ -125,10 +146,6 @@ async def extract_start(
     url: str | None = Form(None),
     x_api_key: str = Header(None),
 ):
-    """
-    Starts a PDF extraction job and returns quickly with job_id.
-    Stores per-page text into Neon (pdf_extract_pages).
-    """
     require_api_key(x_api_key)
 
     try:
@@ -136,8 +153,6 @@ async def extract_start(
     except Exception:
         raise HTTPException(status_code=422, detail="document_id must be a UUID string")
 
-    # Idempotency: if the same (document_id, changed_id) already has a job that isn't failed,
-    # return it (so retries from n8n don't spawn duplicates).
     existing = await db_one(
         """
         SELECT job_id, status, num_pages, inserted_pages, error
@@ -146,6 +161,9 @@ async def extract_start(
         """,
         doc_uuid, changed_id
     )
+
+    # Idempotent behavior:
+    # - queued/running/done => return existing
     if existing and existing["status"] in ("queued", "running", "done"):
         return {
             "job_id": str(existing["job_id"]),
@@ -156,25 +174,35 @@ async def extract_start(
             "idempotent": True,
         }
 
+    # - failed => reuse same job_id and resume (pages already stored remain)
+    if existing and existing["status"] == "failed":
+        job_id = existing["job_id"]
+        await db_exec(
+            """
+            UPDATE public.pdf_extract_jobs
+            SET status='queued', error=NULL, updated_at=now(), started_at=NULL, completed_at=NULL
+            WHERE job_id=$1
+            """,
+            job_id
+        )
+        pdf_path = await save_upload_to_tmp(file)
+        background_tasks.add_task(process_job, job_id, pdf_path)
+        return {"job_id": str(job_id), "status": "queued", "idempotent": True, "resumed": True}
+
+    # No existing job => create new
     job_id = uuid.uuid4()
-
-    # Read file bytes now (request can close; background task needs bytes)
-    pdf_bytes = await file.read()
-
     await db_exec(
         """
         INSERT INTO public.pdf_extract_jobs
           (job_id, document_id, changed_id, file_id, title, source, url, status, created_at, updated_at)
         VALUES
           ($1, $2, $3, $4, $5, $6, $7, 'queued', now(), now())
-        ON CONFLICT (document_id, changed_id)
-        DO UPDATE SET
-          updated_at=now()
         """,
         job_id, doc_uuid, changed_id, file_id, title, source, url
     )
 
-    background_tasks.add_task(process_job, job_id, pdf_bytes)
+    pdf_path = await save_upload_to_tmp(file)
+    background_tasks.add_task(process_job, job_id, pdf_path)
 
     return {"job_id": str(job_id), "status": "queued"}
 
@@ -188,7 +216,8 @@ async def extract_status(job_id: str, x_api_key: str = Header(None)):
 
     row = await db_one(
         """
-        SELECT job_id, document_id, changed_id, status, num_pages, inserted_pages, error, created_at, updated_at, started_at, completed_at
+        SELECT job_id, document_id, changed_id, status, num_pages, inserted_pages, error,
+               created_at, updated_at, started_at, completed_at
         FROM public.pdf_extract_jobs
         WHERE job_id=$1
         """,
@@ -218,17 +247,12 @@ async def extract_pages(
     limit: int = Query(50, ge=1, le=200),
     x_api_key: str = Header(None),
 ):
-    """
-    Returns pages already extracted for a job, in a stable order.
-    Use offset/limit for batching (n8n-friendly).
-    """
     require_api_key(x_api_key)
     try:
         job_uuid = uuid.UUID(job_id)
     except Exception:
         raise HTTPException(status_code=422, detail="job_id must be a UUID string")
 
-    # Validate job exists
     job = await db_one(
         "SELECT status, num_pages, inserted_pages, error FROM public.pdf_extract_jobs WHERE job_id=$1",
         job_uuid
@@ -258,41 +282,11 @@ async def extract_pages(
         "pages": [{"pdf_page": r["pdf_page"], "text": r["text"]} for r in rows],
     }
 
-@app.post("/extract/retry/{job_id}")
-async def extract_retry(job_id: str, x_api_key: str = Header(None)):
-    """
-    Optional helper: mark a failed job as queued again (pages already stored remain).
-    You can call this from n8n if you detect a failed/stale run.
-    """
-    require_api_key(x_api_key)
-    try:
-        job_uuid = uuid.UUID(job_id)
-    except Exception:
-        raise HTTPException(status_code=422, detail="job_id must be a UUID string")
-
-    row = await db_one("SELECT status FROM public.pdf_extract_jobs WHERE job_id=$1", job_uuid)
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if row["status"] not in ("failed",):
-        return {"job_id": job_id, "status": row["status"], "note": "Job not in failed state"}
-
-    await db_exec(
-        """
-        UPDATE public.pdf_extract_jobs
-        SET status='queued', error=NULL, updated_at=now(), started_at=NULL, completed_at=NULL
-        WHERE job_id=$1
-        """,
-        job_uuid
-    )
-    return {"job_id": job_id, "status": "queued"}
-
 # ----------------------------
-# Worker: process one job
+# Worker: process one job (pdfium + resume)
 # ----------------------------
 
-async def process_job(job_id: uuid.UUID, pdf_bytes: bytes):
-    # Mark running
+async def process_job(job_id: uuid.UUID, pdf_path: str):
     await db_exec(
         """
         UPDATE public.pdf_extract_jobs
@@ -303,56 +297,96 @@ async def process_job(job_id: uuid.UUID, pdf_bytes: bytes):
     )
 
     try:
-        pages_out = []
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            num_pages = len(pdf.pages)
+        # Load existing pages (resume)
+        existing_rows = await db_all(
+            "SELECT pdf_page FROM public.pdf_extract_pages WHERE job_id=$1",
+            job_id
+        )
+        existing_pages = {int(r["pdf_page"]) for r in existing_rows}
+
+        # Count already inserted robustly
+        inserted = len(existing_pages)
+        await db_exec(
+            "UPDATE public.pdf_extract_jobs SET inserted_pages=$2, updated_at=now() WHERE job_id=$1",
+            job_id, inserted
+        )
+
+        # Open PDF from disk (avoid RAM blowups)
+        pdf = pdfium.PdfDocument(pdf_path)
+        num_pages = len(pdf)
+
+        await db_exec(
+            "UPDATE public.pdf_extract_jobs SET num_pages=$2, updated_at=now() WHERE job_id=$1",
+            job_id, num_pages
+        )
+
+        # Extract per page, skip already stored (resume)
+        # Update progress every N "processed" pages to reduce DB load.
+        progress_every = 25
+
+        for i in range(1, num_pages + 1):
+            if i in existing_pages:
+                continue
+
+            page = pdf.get_page(i - 1)
+            textpage = page.get_textpage()
+            text = textpage.get_text_range() or ""
+            # Free objects ASAP
+            textpage.close()
+            page.close()
+
+            # Insert only if missing (resume-safe)
+            # We use DO NOTHING; inserted_pages becomes count(*) later to avoid drift.
             await db_exec(
                 """
-                UPDATE public.pdf_extract_jobs
-                SET num_pages=$2, updated_at=now()
-                WHERE job_id=$1
+                INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (job_id, pdf_page) DO NOTHING
                 """,
-                job_id, num_pages
+                job_id, i, text
             )
 
-            # Extract + upsert per page (so we can resume / partial-read)
-            inserted = 0
-            for i, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                # Upsert each page
+            inserted += 1
+
+            if inserted % progress_every == 0 or inserted == num_pages:
+                # Recompute count from DB (robust vs restarts/duplicates)
+                row = await db_one(
+                    "SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1",
+                    job_id
+                )
+                cnt = int(row["cnt"])
                 await db_exec(
                     """
-                    INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (job_id, pdf_page) DO UPDATE SET text=EXCLUDED.text
+                    UPDATE public.pdf_extract_jobs
+                    SET inserted_pages=$2, updated_at=now()
+                    WHERE job_id=$1
                     """,
-                    job_id, i, text
+                    job_id, cnt
                 )
-                inserted += 1
 
-                # Update progress every N pages (reduce DB chatter a bit)
-                if inserted % 10 == 0 or inserted == num_pages:
-                    await db_exec(
-                        """
-                        UPDATE public.pdf_extract_jobs
-                        SET inserted_pages=$2, updated_at=now()
-                        WHERE job_id=$1
-                        """,
-                        job_id, inserted
-                    )
+            # Yield occasionally
+            if inserted % 10 == 0:
+                await asyncio.sleep(0)
 
-                # Yield to event loop occasionally (keeps server responsive)
-                if inserted % 5 == 0:
-                    await asyncio.sleep(0)
+        # Finalize (recompute and set done if complete)
+        row = await db_one(
+            "SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1",
+            job_id
+        )
+        cnt = int(row["cnt"])
 
-        # Done
+        status = "done" if (num_pages is not None and cnt >= num_pages) else "running"
         await db_exec(
             """
             UPDATE public.pdf_extract_jobs
-            SET status='done', inserted_pages=COALESCE(num_pages, inserted_pages), completed_at=now(), updated_at=now()
+            SET status=$2,
+                inserted_pages=$3,
+                completed_at=CASE WHEN $2='done' THEN now() ELSE completed_at END,
+                updated_at=now(),
+                error=NULL
             WHERE job_id=$1
             """,
-            job_id
+            job_id, status, cnt
         )
 
     except Exception as e:
@@ -364,3 +398,9 @@ async def process_job(job_id: uuid.UUID, pdf_bytes: bytes):
             """,
             job_id, str(e)
         )
+    finally:
+        # Clean up temp file
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
