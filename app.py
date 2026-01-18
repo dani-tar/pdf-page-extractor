@@ -256,7 +256,7 @@ async def extract_start(
         url or "",
     )
 
-    # Re-read so the response reflects the updated values (optional, but nice)
+    # Re-read so the response reflects the updated values
     refreshed = await db_one(
         """
         SELECT job_id, status, num_pages, inserted_pages, error, file_id, title, source, url
@@ -278,6 +278,7 @@ async def extract_start(
         "url": refreshed["url"],
         "idempotent": True,
     }
+
 
     # Create new job_id (or reuse failed job_id)
     if existing and existing["status"] == "failed":
