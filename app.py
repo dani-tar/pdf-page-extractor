@@ -27,13 +27,8 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL")  # optional override
 
-# Batch sizing defaults (n8n-friendly)
 DEFAULT_BATCH_PAGES = int(os.environ.get("BATCH_PAGES", "50"))
 PROGRESS_EVERY_PAGES = int(os.environ.get("PROGRESS_EVERY_PAGES", "10"))
-
-# ----------------------------
-# DB helpers
-# ----------------------------
 
 _pool: asyncpg.Pool | None = None
 
@@ -43,14 +38,8 @@ async def get_pool() -> asyncpg.Pool:
     if _pool is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=2)
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
     return _pool
-
-
-async def db_exec(sql: str, *args):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.execute(sql, *args)
 
 
 async def db_one(sql: str, *args):
@@ -59,116 +48,15 @@ async def db_one(sql: str, *args):
         return await conn.fetchrow(sql, *args)
 
 
-async def db_all(sql: str, *args):
+async def db_exec(sql: str, *args):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        return await conn.fetch(sql, *args)
+        return await conn.execute(sql, *args)
 
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ----------------------------
-# Schema bootstrap + migrations
-# ----------------------------
-
-# We do NOT rely on this to define your Neon schema (you already have it),
-# but we keep it to make local/dev easier.
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS public.pdf_extract_jobs (
-  job_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  document_id uuid NOT NULL,
-  changed_id text NOT NULL,
-  source text,
-  file_id text,
-  title text,
-  url text,
-  status text NOT NULL DEFAULT 'queued',
-  last_error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  num_pages integer,
-  inserted_pages integer NOT NULL DEFAULT 0,
-  error text,
-  started_at timestamptz,
-  completed_at timestamptz
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS pdf_extract_jobs_doc_changed_uq
-ON public.pdf_extract_jobs (document_id, changed_id);
-
-CREATE TABLE IF NOT EXISTS public.pdf_extract_pages (
-  job_id uuid NOT NULL REFERENCES public.pdf_extract_jobs(job_id) ON DELETE CASCADE,
-  pdf_page integer NOT NULL,
-  text text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (job_id, pdf_page)
-);
-
-CREATE INDEX IF NOT EXISTS pdf_extract_pages_job_page_idx
-ON public.pdf_extract_pages (job_id, pdf_page);
-"""
-
-# Safe migrations: add columns if missing (doesn't break your existing tables)
-MIGRATE_SQL = """
-ALTER TABLE public.pdf_extract_jobs
-  ADD COLUMN IF NOT EXISTS last_error text;
-
-ALTER TABLE public.pdf_extract_jobs
-  ADD COLUMN IF NOT EXISTS error text;
-
-ALTER TABLE public.pdf_extract_jobs
-  ADD COLUMN IF NOT EXISTS r2_key text;
-
-ALTER TABLE public.pdf_extract_jobs
-  ADD COLUMN IF NOT EXISTS next_page integer;
-
-UPDATE public.pdf_extract_jobs
-SET next_page = 1
-WHERE next_page IS NULL;
-
-ALTER TABLE public.pdf_extract_jobs
-  ALTER COLUMN next_page SET DEFAULT 1;
-
-ALTER TABLE public.pdf_extract_jobs
-  ALTER COLUMN next_page SET NOT NULL;
-"""
-
-
-@app.on_event("startup")
-async def _startup():
-    await get_pool()
-
-    # Create base tables/indexes if missing
-    statements = [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]
-    for stmt in statements:
-        await db_exec(stmt)
-
-    # Apply migrations for existing tables (idempotent)
-    migs = [s.strip() for s in MIGRATE_SQL.split(";") if s.strip()]
-    for stmt in migs:
-        try:
-            await db_exec(stmt)
-        except Exception:
-            # Keep startup resilient; if you want strictness, remove this try/except.
-            pass
-
-
-# ----------------------------
-# Auth
-# ----------------------------
 
 def require_api_key(x_api_key: str | None):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
-
-# ----------------------------
-# R2 client
-# ----------------------------
-
-_s3 = None
 
 
 def get_r2_endpoint() -> str:
@@ -177,6 +65,9 @@ def get_r2_endpoint() -> str:
     if not R2_ACCOUNT_ID:
         raise RuntimeError("R2_ACCOUNT_ID is not set")
     return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+
+_s3 = None
 
 
 def get_s3():
@@ -203,18 +94,10 @@ TRANSFER_CFG = TransferConfig(
 )
 
 
-# ----------------------------
-# Health
-# ----------------------------
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-# ----------------------------
-# Helpers
-# ----------------------------
 
 async def save_upload_to_tmp(upload: UploadFile) -> str:
     tmp_dir = Path(tempfile.gettempdir())
@@ -223,7 +106,7 @@ async def save_upload_to_tmp(upload: UploadFile) -> str:
 
     upload.file.seek(0)
     with open(tmp_path, "wb") as out:
-        shutil.copyfileobj(upload.file, out, length=1024 * 1024)  # 1MB chunks
+        shutil.copyfileobj(upload.file, out, length=1024 * 1024)
     return tmp_path
 
 
@@ -243,7 +126,6 @@ def download_file_from_r2(key: str, local_path: str):
 
 
 async def set_error(job_id: uuid.UUID, message: str):
-    # Write to BOTH last_error and error to keep you compatible while you decide canonical field
     await db_exec(
         """
         UPDATE public.pdf_extract_jobs
@@ -257,10 +139,6 @@ async def set_error(job_id: uuid.UUID, message: str):
         job_id, message
     )
 
-
-# ----------------------------
-# API: start job (upload PDF to R2, idempotent)
-# ----------------------------
 
 @app.post("/extract/start")
 async def extract_start(
@@ -282,16 +160,17 @@ async def extract_start(
 
     existing = await db_one(
         """
-        SELECT job_id, status, num_pages, inserted_pages, last_error, error, r2_key, next_page,
-               file_id, title, source, url
+        SELECT job_id, status, r2_key
         FROM public.pdf_extract_jobs
         WHERE document_id=$1 AND changed_id=$2
+        ORDER BY created_at DESC
+        LIMIT 1
         """,
         doc_uuid, changed_id
     )
 
-    # If job exists, update metadata (idempotent “merge”)
     if existing:
+        job_id = existing["job_id"]
         await db_exec(
             """
             UPDATE public.pdf_extract_jobs
@@ -303,56 +182,47 @@ async def extract_start(
               updated_at = now()
             WHERE job_id = $1
             """,
-            existing["job_id"],
+            job_id,
             file_id or "",
             title or "",
             source or "",
             url or "",
         )
 
-        # If it already has r2_key, we can skip re-upload and return
-        refreshed = await db_one(
-            """
-            SELECT job_id, status, num_pages, inserted_pages, last_error, error, r2_key, next_page,
-                   file_id, title, source, url
-            FROM public.pdf_extract_jobs
-            WHERE job_id=$1
-            """,
-            existing["job_id"]
-        )
-
-        if refreshed["r2_key"]:
+        # Hvis r2_key finnes, ikke re-upload
+        if existing["r2_key"]:
+            row = await db_one(
+                """
+                SELECT job_id, status, num_pages, inserted_pages, next_page, last_error, error, r2_key
+                FROM public.pdf_extract_jobs
+                WHERE job_id=$1
+                """,
+                job_id
+            )
             return {
-                "job_id": str(refreshed["job_id"]),
-                "status": refreshed["status"],
-                "num_pages": refreshed["num_pages"],
-                "inserted_pages": refreshed["inserted_pages"],
-                "last_error": refreshed["last_error"],
-                "error": refreshed["error"],
-                "r2_key": refreshed["r2_key"],
-                "next_page": refreshed["next_page"],
-                "file_id": refreshed["file_id"],
-                "title": refreshed["title"],
-                "source": refreshed["source"],
-                "url": refreshed["url"],
+                "job_id": str(row["job_id"]),
+                "status": row["status"],
+                "num_pages": row["num_pages"],
+                "inserted_pages": row["inserted_pages"],
+                "next_page": row["next_page"],
+                "last_error": row["last_error"],
+                "error": row["error"],
+                "r2_key": row["r2_key"],
                 "idempotent": True,
                 "uploaded": False,
             }
-
-        job_id = refreshed["job_id"]
     else:
         job_id = uuid.uuid4()
         await db_exec(
             """
             INSERT INTO public.pdf_extract_jobs
-              (job_id, document_id, changed_id, source, file_id, title, url, status, created_at, updated_at, inserted_pages)
+              (job_id, document_id, changed_id, source, file_id, title, url, status, created_at, updated_at, inserted_pages, next_page)
             VALUES
-              ($1, $2, $3, $4, $5, $6, $7, 'queued', now(), now(), 0)
+              ($1, $2, $3, $4, $5, $6, $7, 'queued', now(), now(), 0, 1)
             """,
             job_id, doc_uuid, changed_id, source, file_id, title, url
         )
 
-    # Upload to R2
     tmp_path = await save_upload_to_tmp(file)
     r2_key = make_r2_key(document_id, changed_id, job_id)
 
@@ -370,7 +240,11 @@ async def extract_start(
     await db_exec(
         """
         UPDATE public.pdf_extract_jobs
-        SET r2_key=$2, next_page=COALESCE(next_page, 1), last_error=NULL, error=NULL, updated_at=now()
+        SET r2_key=$2,
+            next_page=COALESCE(next_page, 1),
+            last_error=NULL,
+            error=NULL,
+            updated_at=now()
         WHERE job_id=$1
         """,
         job_id, r2_key
@@ -378,10 +252,6 @@ async def extract_start(
 
     return {"job_id": str(job_id), "status": "queued", "r2_key_saved": True, "uploaded": True}
 
-
-# ----------------------------
-# API: status
-# ----------------------------
 
 @app.get("/extract/status/{job_id}")
 async def extract_status(job_id: str, x_api_key: str = Header(None)):
@@ -429,10 +299,6 @@ async def extract_status(job_id: str, x_api_key: str = Header(None)):
     }
 
 
-# ----------------------------
-# API: read pages
-# ----------------------------
-
 @app.get("/extract/pages/{job_id}")
 async def extract_pages(
     job_id: str,
@@ -453,16 +319,18 @@ async def extract_pages(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    rows = await db_all(
-        """
-        SELECT pdf_page, text
-        FROM public.pdf_extract_pages
-        WHERE job_id=$1
-        ORDER BY pdf_page
-        OFFSET $2 LIMIT $3
-        """,
-        job_uuid, offset, limit
-    )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT pdf_page, text
+            FROM public.pdf_extract_pages
+            WHERE job_id=$1
+            ORDER BY pdf_page
+            OFFSET $2 LIMIT $3
+            """,
+            job_uuid, offset, limit
+        )
 
     return {
         "job_id": job_id,
@@ -477,11 +345,6 @@ async def extract_pages(
     }
 
 
-# ----------------------------
-# API: work step (batch processing, resume-safe)
-# n8n calls this repeatedly until status=done
-# ----------------------------
-
 @app.post("/extract/work/{job_id}")
 async def extract_work(
     job_id: str,
@@ -494,152 +357,223 @@ async def extract_work(
     except Exception:
         raise HTTPException(status_code=422, detail="job_id must be a UUID string")
 
-    job = await db_one(
-        """
-        SELECT job_id, status, num_pages, inserted_pages, last_error, error, r2_key, next_page
-        FROM public.pdf_extract_jobs
-        WHERE job_id=$1
-        """,
-        job_uuid
-    )
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job["r2_key"]:
-        raise HTTPException(status_code=400, detail="Job has no r2_key (did /extract/start complete?)")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1) Advisory lock per job: hindrer parallel /work på samme jobb
+        locked = await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", str(job_uuid))
+        if not locked:
+            raise HTTPException(status_code=409, detail="Job is currently being processed (lock busy)")
 
-    if job["status"] == "done":
-        return {
-            "job_id": job_id,
-            "status": "done",
-            "num_pages": job["num_pages"],
-            "inserted_pages": job["inserted_pages"],
-            "next_page": job["next_page"],
-        }
+        try:
+            job = await conn.fetchrow(
+                """
+                SELECT job_id, status, num_pages, inserted_pages, last_error, error, r2_key, next_page
+                FROM public.pdf_extract_jobs
+                WHERE job_id=$1
+                """,
+                job_uuid
+            )
+            if not job:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if not job["r2_key"]:
+                raise HTTPException(status_code=400, detail="Job has no r2_key (did /extract/start complete?)")
 
-    # Mark running if needed
-    if job["status"] in ("queued", "failed"):
-        await db_exec(
-            """
-            UPDATE public.pdf_extract_jobs
-            SET status='running',
-                started_at=COALESCE(started_at, now()),
-                updated_at=now(),
-                last_error=NULL,
-                error=NULL
-            WHERE job_id=$1
-            """,
-            job_uuid
-        )
+            if job["status"] == "done":
+                return {
+                    "job_id": job_id,
+                    "status": "done",
+                    "num_pages": job["num_pages"],
+                    "inserted_pages": job["inserted_pages"],
+                    "next_page": job["next_page"],
+                }
 
+            # Mark running
+            if job["status"] in ("queued", "failed"):
+                await conn.execute(
+                    """
+                    UPDATE public.pdf_extract_jobs
+                    SET status='running',
+                        started_at=COALESCE(started_at, now()),
+                        updated_at=now(),
+                        last_error=NULL,
+                        error=NULL
+                    WHERE job_id=$1
+                    """,
+                    job_uuid
+                )
+
+        finally:
+            # Ikke unlock her – vi vil holde låsen gjennom hele batch-arbeidet
+            pass
+
+    # 2) Last ned PDF til temp
     tmp_dir = Path(tempfile.gettempdir())
     fd, pdf_path = tempfile.mkstemp(prefix=f"job_{job_id}_", suffix=".pdf", dir=str(tmp_dir))
     os.close(fd)
 
     try:
-        await asyncio.to_thread(download_file_from_r2, job["r2_key"], pdf_path)
+        # Vi bruker job fra DB på nytt i transaksjon senere; men trenger r2_key nå
+        job_row = await db_one(
+            "SELECT r2_key, next_page, num_pages, inserted_pages, status FROM public.pdf_extract_jobs WHERE job_id=$1",
+            job_uuid
+        )
+        await asyncio.to_thread(download_file_from_r2, job_row["r2_key"], pdf_path)
 
         pdf = pdfium.PdfDocument(pdf_path)
-        num_pages = len(pdf)
+        try:
+            num_pages = len(pdf)
+        except Exception:
+            # Hvis pdfium feiler å lese lengde, marker fail
+            await set_error(job_uuid, "Failed to read PDF page count")
+            raise HTTPException(status_code=500, detail="Failed to read PDF page count")
 
-        # Save num_pages once
-        if job["num_pages"] is None:
-            await db_exec(
-                "UPDATE public.pdf_extract_jobs SET num_pages=$2, updated_at=now() WHERE job_id=$1",
-                job_uuid, num_pages
-            )
-
-        start_page = int(job["next_page"] or 1)
+        # start/end
+        start_page = int(job_row["next_page"] or 1)
         if start_page < 1:
             start_page = 1
+
+        if start_page > num_pages:
+            # Alt bør allerede være gjort
+            await db_exec(
+                """
+                UPDATE public.pdf_extract_jobs
+                SET status='done',
+                    num_pages=COALESCE(num_pages, $2),
+                    completed_at=COALESCE(completed_at, now()),
+                    updated_at=now()
+                WHERE job_id=$1
+                """,
+                job_uuid, num_pages
+            )
+            return {
+                "job_id": job_id,
+                "status": "done",
+                "num_pages": num_pages,
+                "inserted_pages": job_row["inserted_pages"],
+                "next_page": start_page,
+                "batch_start": start_page,
+                "batch_end": start_page - 1,
+                "batch_processed": 0,
+                "batch_inserted": 0,
+            }
 
         end_page = min(start_page + int(max_pages) - 1, num_pages)
 
         processed = 0
-        inserted_in_this_call = 0
+        inserted = 0
 
-        for page_no in range(start_page, end_page + 1):
-            # Resume-safe: skip if exists
-            exists = await db_one(
-                "SELECT 1 FROM public.pdf_extract_pages WHERE job_id=$1 AND pdf_page=$2",
-                job_uuid, page_no
-            )
-            if exists:
-                processed += 1
-                continue
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Hold DB-lås gjennom inserts + updates
+            locked = await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", str(job_uuid))
+            if not locked:
+                raise HTTPException(status_code=409, detail="Job is currently being processed (lock busy)")
 
-            page = pdf.get_page(page_no - 1)
-            textpage = page.get_textpage()
-            text = textpage.get_text_range() or ""
-            textpage.close()
-            page.close()
-
-            await db_exec(
-                """
-                INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (job_id, pdf_page) DO NOTHING
-                """,
-                job_uuid, page_no, text
-            )
-
-            inserted_in_this_call += 1
-            processed += 1
-
-            if inserted_in_this_call % PROGRESS_EVERY_PAGES == 0:
-                row = await db_one(
-                    "SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1",
-                    job_uuid
-                )
-                await db_exec(
+            try:
+                # Sett num_pages hvis mangler
+                await conn.execute(
                     """
                     UPDATE public.pdf_extract_jobs
-                    SET inserted_pages=$2, updated_at=now()
+                    SET num_pages = COALESCE(num_pages, $2),
+                        updated_at = now()
                     WHERE job_id=$1
                     """,
-                    job_uuid, int(row["cnt"])
+                    job_uuid, num_pages
                 )
 
-            if inserted_in_this_call % 10 == 0:
-                await asyncio.sleep(0)
+                for page_no in range(start_page, end_page + 1):
+                    page = pdf.get_page(page_no - 1)
+                    textpage = page.get_textpage()
+                    text = (textpage.get_text_range() or "")
+                    textpage.close()
+                    page.close()
 
-        # Recompute count and update cursor/status
-        row = await db_one("SELECT COUNT(*)::int AS cnt FROM public.pdf_extract_pages WHERE job_id=$1", job_uuid)
-        cnt = int(row["cnt"])
+                    # Insert (resume-safe) og tell om den faktisk ble satt inn
+                    r = await conn.fetchrow(
+                        """
+                        INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (job_id, pdf_page) DO NOTHING
+                        RETURNING 1 AS inserted
+                        """,
+                        job_uuid, page_no, text
+                    )
+                    if r:
+                        inserted += 1
 
-        new_next_page = end_page + 1
-        status = "done" if cnt >= num_pages else "running"
+                    processed += 1
 
-        await db_exec(
-            """
-            UPDATE public.pdf_extract_jobs
-            SET inserted_pages=$2,
-                next_page=$3,
-                status=$4,
-                completed_at=CASE WHEN $4='done' THEN now() ELSE completed_at END,
-                updated_at=now(),
-                last_error=NULL,
-                error=NULL
-            WHERE job_id=$1
-            """,
-            job_uuid, cnt, new_next_page, status
-        )
+                    if processed % PROGRESS_EVERY_PAGES == 0:
+                        await conn.execute(
+                            """
+                            UPDATE public.pdf_extract_jobs
+                            SET inserted_pages = inserted_pages + $2,
+                                updated_at = now()
+                            WHERE job_id=$1
+                            """,
+                            job_uuid, inserted
+                        )
+                        inserted = 0  # “flush” delsum
 
-        return {
-            "job_id": job_id,
-            "status": status,
-            "num_pages": num_pages,
-            "inserted_pages": cnt,
-            "batch_start": start_page,
-            "batch_end": end_page,
-            "batch_processed": processed,
-            "batch_inserted": inserted_in_this_call,
-            "next_page": new_next_page,
-        }
+                    if processed % 10 == 0:
+                        await asyncio.sleep(0)
 
-    except Exception as e:
-        msg = str(e)
-        await set_error(job_uuid, msg)
-        raise HTTPException(status_code=500, detail=msg)
+                # flush siste delsum
+                if inserted:
+                    await conn.execute(
+                        """
+                        UPDATE public.pdf_extract_jobs
+                        SET inserted_pages = inserted_pages + $2,
+                            updated_at = now()
+                        WHERE job_id=$1
+                        """,
+                        job_uuid, inserted
+                    )
+
+                # Hent oppdatert teller og avgjør status
+                final = await conn.fetchrow(
+                    "SELECT inserted_pages, num_pages FROM public.pdf_extract_jobs WHERE job_id=$1",
+                    job_uuid
+                )
+                final_inserted = int(final["inserted_pages"] or 0)
+                final_num_pages = int(final["num_pages"] or num_pages)
+
+                new_next_page = end_page + 1
+                status = "done" if final_inserted >= final_num_pages else "running"
+
+                await conn.execute(
+                    """
+                    UPDATE public.pdf_extract_jobs
+                    SET next_page=$2,
+                        status=$3,
+                        completed_at=CASE WHEN $3='done' THEN now() ELSE completed_at END,
+                        updated_at=now(),
+                        last_error=NULL,
+                        error=NULL
+                    WHERE job_id=$1
+                    """,
+                    job_uuid, new_next_page, status
+                )
+
+                return {
+                    "job_id": job_id,
+                    "status": status,
+                    "num_pages": final_num_pages,
+                    "inserted_pages": final_inserted,
+                    "batch_start": start_page,
+                    "batch_end": end_page,
+                    "batch_processed": processed,
+                    "next_page": new_next_page,
+                }
+
+            except Exception as e:
+                await set_error(job_uuid, str(e))
+                raise HTTPException(status_code=500, detail=str(e))
+            finally:
+                try:
+                    await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", str(job_uuid))
+                except Exception:
+                    pass
 
     finally:
         try:
