@@ -236,17 +236,48 @@ async def extract_start(
         doc_uuid, changed_id
     )
 
-    # If already have a job and it has r2_key, reuse it (idempotent)
-    if existing and existing["status"] in ("queued", "running", "done") and existing["r2_key"]:
-        return {
-            "job_id": str(existing["job_id"]),
-            "status": existing["status"],
-            "num_pages": existing["num_pages"],
-            "inserted_pages": existing["inserted_pages"],
-            "next_page": existing["next_page"],
-            "error": existing["error"],
-            "idempotent": True,
-        }
+    if existing and existing["status"] in ("queued", "running", "done"):
+    # Merge metadata if the new request contains values (idempotent-safe)
+    await db_exec(
+        """
+        UPDATE public.pdf_extract_jobs
+        SET
+          file_id = COALESCE(NULLIF($2,''), file_id),
+          title   = COALESCE(NULLIF($3,''), title),
+          source  = COALESCE(NULLIF($4,''), source),
+          url     = COALESCE(NULLIF($5,''), url),
+          updated_at = now()
+        WHERE job_id = $1
+        """,
+        existing["job_id"],
+        file_id or "",
+        title or "",
+        source or "",
+        url or "",
+    )
+
+    # Re-read so the response reflects the updated values (optional, but nice)
+    refreshed = await db_one(
+        """
+        SELECT job_id, status, num_pages, inserted_pages, error, file_id, title, source, url
+        FROM public.pdf_extract_jobs
+        WHERE job_id=$1
+        """,
+        existing["job_id"]
+    )
+
+    return {
+        "job_id": str(refreshed["job_id"]),
+        "status": refreshed["status"],
+        "num_pages": refreshed["num_pages"],
+        "inserted_pages": refreshed["inserted_pages"],
+        "error": refreshed["error"],
+        "file_id": refreshed["file_id"],
+        "title": refreshed["title"],
+        "source": refreshed["source"],
+        "url": refreshed["url"],
+        "idempotent": True,
+    }
 
     # Create new job_id (or reuse failed job_id)
     if existing and existing["status"] == "failed":
