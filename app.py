@@ -32,8 +32,12 @@ DEFAULT_BATCH_PAGES = int(os.environ.get("BATCH_PAGES", "50"))
 PROGRESS_EVERY_PAGES = int(os.environ.get("PROGRESS_EVERY_PAGES", "10"))
 
 _pool: asyncpg.Pool | None = None
+_s3 = None
 
 
+# ----------------------------
+# DB helpers
+# ----------------------------
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
@@ -60,15 +64,15 @@ def require_api_key(x_api_key: str | None):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+# ----------------------------
+# R2 client
+# ----------------------------
 def get_r2_endpoint() -> str:
     if R2_ENDPOINT_URL:
         return R2_ENDPOINT_URL
     if not R2_ACCOUNT_ID:
         raise RuntimeError("R2_ACCOUNT_ID is not set")
     return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-
-_s3 = None
 
 
 def get_s3():
@@ -95,11 +99,17 @@ TRANSFER_CFG = TransferConfig(
 )
 
 
+# ----------------------------
+# Health
+# ----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+# ----------------------------
+# Generic helpers
+# ----------------------------
 async def save_upload_to_tmp(upload: UploadFile) -> str:
     tmp_dir = Path(tempfile.gettempdir())
     fd, tmp_path = tempfile.mkstemp(prefix="pdf_", suffix=".pdf", dir=str(tmp_dir))
@@ -142,10 +152,12 @@ async def set_error(job_id: uuid.UUID, message: str):
 
 
 # ----------------------------
-# R2: list + delete by prefix (for cleanup workflow)
+# R2: list + delete by prefix (cleanup workflow)
 # ----------------------------
-
-def list_r2_keys(prefix: str, max_keys: int = 1000) -> List[str]:
+def list_r2_keys_all(prefix: str, page_size: int = 1000) -> List[str]:
+    """
+    Lists ALL keys for a prefix, using ContinuationToken pagination.
+    """
     s3 = get_s3()
     keys: List[str] = []
     token: Optional[str] = None
@@ -154,13 +166,13 @@ def list_r2_keys(prefix: str, max_keys: int = 1000) -> List[str]:
         kwargs: Dict[str, Any] = {
             "Bucket": R2_BUCKET_NAME,
             "Prefix": prefix,
-            "MaxKeys": max_keys,
+            "MaxKeys": page_size,
         }
         if token:
             kwargs["ContinuationToken"] = token
 
         resp = s3.list_objects_v2(**kwargs)
-        contents = resp.get("Contents", [])
+        contents = resp.get("Contents", []) or []
         for obj in contents:
             k = obj.get("Key")
             if k:
@@ -176,10 +188,17 @@ def list_r2_keys(prefix: str, max_keys: int = 1000) -> List[str]:
     return keys
 
 
-def delete_r2_keys(keys: List[str]) -> Dict[str, Any]:
+def delete_r2_keys_batched(keys: List[str]) -> Dict[str, Any]:
+    """
+    Deletes keys in batches of 1000 (S3 API limit).
+    Returns a robust summary:
+      - deleted: number of keys reported deleted by API
+      - errors: list of errors returned by API
+      - requested: number of keys requested to delete
+    """
     s3 = get_s3()
-    deleted = 0
-    errors: List[Dict[str, Any]] = []
+    deleted_total = 0
+    errors_total: List[Dict[str, Any]] = []
 
     for i in range(0, len(keys), 1000):
         batch = keys[i:i + 1000]
@@ -187,22 +206,27 @@ def delete_r2_keys(keys: List[str]) -> Dict[str, Any]:
             Bucket=R2_BUCKET_NAME,
             Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
         )
-        deleted += len(resp.get("Deleted", []))
-        errors.extend(resp.get("Errors", []))
+        deleted_total += len(resp.get("Deleted", []) or [])
+        errors_total.extend(resp.get("Errors", []) or [])
 
-    return {"deleted": deleted, "errors": errors}
+    return {"requested": len(keys), "deleted": deleted_total, "errors": errors_total}
 
 
 @app.get("/r2/list")
 async def r2_list(prefix: str, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
+
+    prefix = (prefix or "").strip()
     if not prefix:
         raise HTTPException(status_code=422, detail="prefix is required")
 
     try:
-        keys = await asyncio.to_thread(list_r2_keys, prefix)
-        # Return a capped list to avoid huge responses
-        return {"prefix": prefix, "count": len(keys), "keys": keys[:200]}
+        keys = await asyncio.to_thread(list_r2_keys_all, prefix)
+        return {
+            "prefix": prefix,
+            "count": len(keys),
+            "keys": keys[:200],  # cap list for response size
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"R2 list failed: {str(e)}")
 
@@ -215,22 +239,30 @@ async def r2_delete_prefix(payload: dict = Body(...), x_api_key: str = Header(No
     if not prefix or not isinstance(prefix, str):
         raise HTTPException(status_code=422, detail="payload must include string field 'prefix'")
 
+    prefix = prefix.strip()
+
     # Safety guard: only allow deleting under pdf/
     if not prefix.startswith("pdf/"):
         raise HTTPException(status_code=400, detail="Refusing to delete: prefix must start with 'pdf/'")
 
     try:
-        keys = await asyncio.to_thread(list_r2_keys, prefix)
+        keys = await asyncio.to_thread(list_r2_keys_all, prefix)
         if not keys:
-            return {"prefix": prefix, "deleted": 0, "message": "No objects found"}
+            return {"prefix": prefix, "listed": 0, "deleted": 0, "errors": 0}
 
-        result = await asyncio.to_thread(delete_r2_keys, keys)
+        result = await asyncio.to_thread(delete_r2_keys_batched, keys)
 
-        if result.get("errors"):
-            # fail hard so n8n sees it
-            raise RuntimeError(f"Partial delete: deleted={result.get('deleted')} errors={result.get('errors')}")
+        # If partial errors, fail hard so n8n sees it
+        if result["errors"]:
+            raise RuntimeError(f"Partial delete: {result}")
 
-        return {"prefix": prefix, "deleted": result["deleted"]}
+        return {
+            "prefix": prefix,
+            "listed": len(keys),
+            "deleted": result["deleted"],
+            "errors": 0,
+            "sample": keys[:3],
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"R2 delete-prefix failed: {str(e)}")
 
@@ -238,7 +270,6 @@ async def r2_delete_prefix(payload: dict = Body(...), x_api_key: str = Header(No
 # ----------------------------
 # PDF Extract API
 # ----------------------------
-
 @app.post("/extract/start")
 async def extract_start(
     file: UploadFile = File(...),
@@ -288,6 +319,7 @@ async def extract_start(
             url or "",
         )
 
+        # If r2_key exists, skip re-upload
         if existing["r2_key"]:
             row = await db_one(
                 """
@@ -354,6 +386,7 @@ async def extract_start(
 @app.get("/extract/status/{job_id}")
 async def extract_status(job_id: str, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
+
     try:
         job_uuid = uuid.UUID(job_id)
     except Exception:
@@ -405,6 +438,7 @@ async def extract_pages(
     x_api_key: str = Header(None),
 ):
     require_api_key(x_api_key)
+
     try:
         job_uuid = uuid.UUID(job_id)
     except Exception:
@@ -450,19 +484,20 @@ async def extract_work(
     x_api_key: str = Header(None),
 ):
     require_api_key(x_api_key)
+
     try:
         job_uuid = uuid.UUID(job_id)
     except Exception:
         raise HTTPException(status_code=422, detail="job_id must be a UUID string")
 
-    # Acquire a per-job advisory lock for the whole /work call.
-    # This prevents parallel /work calls on the same job.
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # per-job advisory lock for the full /work call
         locked = await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", str(job_uuid))
         if not locked:
             raise HTTPException(status_code=409, detail="Job is currently being processed (lock busy)")
 
+        pdf_path = None
         try:
             job = await conn.fetchrow(
                 """
@@ -500,104 +535,88 @@ async def extract_work(
                     job_uuid
                 )
 
-            # Download PDF to temp (outside DB, but we keep advisory lock through whole function)
+            # download PDF
             tmp_dir = Path(tempfile.gettempdir())
             fd, pdf_path = tempfile.mkstemp(prefix=f"job_{job_id}_", suffix=".pdf", dir=str(tmp_dir))
             os.close(fd)
 
+            await asyncio.to_thread(download_file_from_r2, job["r2_key"], pdf_path)
+
+            pdf = pdfium.PdfDocument(pdf_path)
             try:
-                await asyncio.to_thread(download_file_from_r2, job["r2_key"], pdf_path)
+                num_pages = len(pdf)
+            except Exception:
+                await set_error(job_uuid, "Failed to read PDF page count")
+                raise HTTPException(status_code=500, detail="Failed to read PDF page count")
 
-                pdf = pdfium.PdfDocument(pdf_path)
-                try:
-                    num_pages = len(pdf)
-                except Exception:
-                    await set_error(job_uuid, "Failed to read PDF page count")
-                    raise HTTPException(status_code=500, detail="Failed to read PDF page count")
+            # persist num_pages if missing
+            await conn.execute(
+                """
+                UPDATE public.pdf_extract_jobs
+                SET num_pages = COALESCE(num_pages, $2),
+                    updated_at = now()
+                WHERE job_id=$1
+                """,
+                job_uuid, num_pages
+            )
 
-                # Save num_pages once
+            start_page = int(job["next_page"] or 1)
+            if start_page < 1:
+                start_page = 1
+
+            if start_page > num_pages:
                 await conn.execute(
                     """
                     UPDATE public.pdf_extract_jobs
-                    SET num_pages = COALESCE(num_pages, $2),
-                        updated_at = now()
+                    SET status='done',
+                        completed_at=COALESCE(completed_at, now()),
+                        updated_at=now()
                     WHERE job_id=$1
                     """,
-                    job_uuid, num_pages
+                    job_uuid
                 )
+                return {
+                    "job_id": job_id,
+                    "status": "done",
+                    "num_pages": num_pages,
+                    "inserted_pages": int(job["inserted_pages"] or 0),
+                    "next_page": start_page,
+                    "batch_start": start_page,
+                    "batch_end": start_page - 1,
+                    "batch_processed": 0,
+                    "batch_inserted": 0,
+                }
 
-                start_page = int(job["next_page"] or 1)
-                if start_page < 1:
-                    start_page = 1
+            end_page = min(start_page + int(max_pages) - 1, num_pages)
 
-                if start_page > num_pages:
-                    # nothing left; mark done
-                    await conn.execute(
-                        """
-                        UPDATE public.pdf_extract_jobs
-                        SET status='done',
-                            completed_at=COALESCE(completed_at, now()),
-                            updated_at=now()
-                        WHERE job_id=$1
-                        """,
-                        job_uuid
-                    )
-                    return {
-                        "job_id": job_id,
-                        "status": "done",
-                        "num_pages": num_pages,
-                        "inserted_pages": int(job["inserted_pages"] or 0),
-                        "next_page": start_page,
-                        "batch_start": start_page,
-                        "batch_end": start_page - 1,
-                        "batch_processed": 0,
-                        "batch_inserted": 0,
-                    }
+            processed = 0
+            inserted_in_call = 0
 
-                end_page = min(start_page + int(max_pages) - 1, num_pages)
+            for page_no in range(start_page, end_page + 1):
+                page = pdf.get_page(page_no - 1)
+                textpage = page.get_textpage()
+                text = (textpage.get_text_range() or "")
+                textpage.close()
+                page.close()
 
-                processed = 0
-                inserted = 0
+                r = await conn.fetchrow(
+                    """
+                    INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (job_id, pdf_page) DO NOTHING
+                    RETURNING 1 AS inserted
+                    """,
+                    job_uuid, page_no, text
+                )
+                if r:
+                    inserted_in_call += 1
 
-                for page_no in range(start_page, end_page + 1):
-                    page = pdf.get_page(page_no - 1)
-                    textpage = page.get_textpage()
-                    text = (textpage.get_text_range() or "")
-                    textpage.close()
-                    page.close()
+                processed += 1
 
-                    r = await conn.fetchrow(
-                        """
-                        INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT (job_id, pdf_page) DO NOTHING
-                        RETURNING 1 AS inserted
-                        """,
-                        job_uuid, page_no, text
-                    )
-                    if r:
-                        inserted += 1
+                if processed % 10 == 0:
+                    await asyncio.sleep(0)
 
-                    processed += 1
-
-                    if processed % 10 == 0:
-                        await asyncio.sleep(0)
-
-                    # Periodic heartbeat/progress
-                    if processed % PROGRESS_EVERY_PAGES == 0:
-                        await conn.execute(
-                            """
-                            UPDATE public.pdf_extract_jobs
-                            SET inserted_pages = inserted_pages + $2,
-                                updated_at = now()
-                            WHERE job_id=$1
-                            """,
-                            job_uuid, inserted
-                        )
-                        inserted = 0
-
-                # flush remainder
-                if inserted:
+                if processed % PROGRESS_EVERY_PAGES == 0 and inserted_in_call:
                     await conn.execute(
                         """
                         UPDATE public.pdf_extract_jobs
@@ -605,56 +624,69 @@ async def extract_work(
                             updated_at = now()
                         WHERE job_id=$1
                         """,
-                        job_uuid, inserted
+                        job_uuid, inserted_in_call
                     )
+                    inserted_in_call = 0
 
-                final = await conn.fetchrow(
-                    "SELECT inserted_pages, num_pages FROM public.pdf_extract_jobs WHERE job_id=$1",
-                    job_uuid
-                )
-                final_inserted = int(final["inserted_pages"] or 0)
-                final_num_pages = int(final["num_pages"] or num_pages)
-
-                new_next_page = end_page + 1
-                status = "done" if final_inserted >= final_num_pages else "running"
-
+            if inserted_in_call:
                 await conn.execute(
                     """
                     UPDATE public.pdf_extract_jobs
-                    SET next_page=$2,
-                        status=$3,
-                        completed_at=CASE WHEN $3='done' THEN now() ELSE completed_at END,
-                        updated_at=now(),
-                        last_error=NULL,
-                        error=NULL
+                    SET inserted_pages = inserted_pages + $2,
+                        updated_at = now()
                     WHERE job_id=$1
                     """,
-                    job_uuid, new_next_page, status
+                    job_uuid, inserted_in_call
                 )
 
-                return {
-                    "job_id": job_id,
-                    "status": status,
-                    "num_pages": final_num_pages,
-                    "inserted_pages": final_inserted,
-                    "batch_start": start_page,
-                    "batch_end": end_page,
-                    "batch_processed": processed,
-                    "next_page": new_next_page,
-                }
+            final = await conn.fetchrow(
+                "SELECT inserted_pages, num_pages FROM public.pdf_extract_jobs WHERE job_id=$1",
+                job_uuid
+            )
+            final_inserted = int(final["inserted_pages"] or 0)
+            final_num_pages = int(final["num_pages"] or num_pages)
 
-            except HTTPException:
-                raise
-            except Exception as e:
-                await set_error(job_uuid, str(e))
-                raise HTTPException(status_code=500, detail=str(e))
-            finally:
+            new_next_page = end_page + 1
+            status = "done" if final_inserted >= final_num_pages else "running"
+
+            await conn.execute(
+                """
+                UPDATE public.pdf_extract_jobs
+                SET next_page=$2,
+                    status=$3,
+                    completed_at=CASE WHEN $3='done' THEN now() ELSE completed_at END,
+                    updated_at=now(),
+                    last_error=NULL,
+                    error=NULL
+                WHERE job_id=$1
+                """,
+                job_uuid, new_next_page, status
+            )
+
+            return {
+                "job_id": job_id,
+                "status": status,
+                "num_pages": final_num_pages,
+                "inserted_pages": final_inserted,
+                "batch_start": start_page,
+                "batch_end": end_page,
+                "batch_processed": processed,
+                "next_page": new_next_page,
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            await set_error(job_uuid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # cleanup temp file
+            if pdf_path:
                 try:
                     os.remove(pdf_path)
                 except Exception:
                     pass
-
-        finally:
+            # release advisory lock
             try:
                 await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", str(job_uuid))
             except Exception:
