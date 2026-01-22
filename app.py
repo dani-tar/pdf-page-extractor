@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form, Query
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Form, Query, Body
 import asyncpg
 import os
 import uuid
@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import shutil
+from typing import Optional, List, Dict, Any
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -140,6 +141,104 @@ async def set_error(job_id: uuid.UUID, message: str):
     )
 
 
+# ----------------------------
+# R2: list + delete by prefix (for cleanup workflow)
+# ----------------------------
+
+def list_r2_keys(prefix: str, max_keys: int = 1000) -> List[str]:
+    s3 = get_s3()
+    keys: List[str] = []
+    token: Optional[str] = None
+
+    while True:
+        kwargs: Dict[str, Any] = {
+            "Bucket": R2_BUCKET_NAME,
+            "Prefix": prefix,
+            "MaxKeys": max_keys,
+        }
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3.list_objects_v2(**kwargs)
+        contents = resp.get("Contents", [])
+        for obj in contents:
+            k = obj.get("Key")
+            if k:
+                keys.append(k)
+
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+            if not token:
+                break
+        else:
+            break
+
+    return keys
+
+
+def delete_r2_keys(keys: List[str]) -> Dict[str, Any]:
+    s3 = get_s3()
+    deleted = 0
+    errors: List[Dict[str, Any]] = []
+
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        resp = s3.delete_objects(
+            Bucket=R2_BUCKET_NAME,
+            Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True},
+        )
+        deleted += len(resp.get("Deleted", []))
+        errors.extend(resp.get("Errors", []))
+
+    return {"deleted": deleted, "errors": errors}
+
+
+@app.get("/r2/list")
+async def r2_list(prefix: str, x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+    if not prefix:
+        raise HTTPException(status_code=422, detail="prefix is required")
+
+    try:
+        keys = await asyncio.to_thread(list_r2_keys, prefix)
+        # Return a capped list to avoid huge responses
+        return {"prefix": prefix, "count": len(keys), "keys": keys[:200]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"R2 list failed: {str(e)}")
+
+
+@app.post("/r2/delete-prefix")
+async def r2_delete_prefix(payload: dict = Body(...), x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+
+    prefix = (payload or {}).get("prefix")
+    if not prefix or not isinstance(prefix, str):
+        raise HTTPException(status_code=422, detail="payload must include string field 'prefix'")
+
+    # Safety guard: only allow deleting under pdf/
+    if not prefix.startswith("pdf/"):
+        raise HTTPException(status_code=400, detail="Refusing to delete: prefix must start with 'pdf/'")
+
+    try:
+        keys = await asyncio.to_thread(list_r2_keys, prefix)
+        if not keys:
+            return {"prefix": prefix, "deleted": 0, "message": "No objects found"}
+
+        result = await asyncio.to_thread(delete_r2_keys, keys)
+
+        if result.get("errors"):
+            # fail hard so n8n sees it
+            raise RuntimeError(f"Partial delete: deleted={result.get('deleted')} errors={result.get('errors')}")
+
+        return {"prefix": prefix, "deleted": result["deleted"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"R2 delete-prefix failed: {str(e)}")
+
+
+# ----------------------------
+# PDF Extract API
+# ----------------------------
+
 @app.post("/extract/start")
 async def extract_start(
     file: UploadFile = File(...),
@@ -189,7 +288,6 @@ async def extract_start(
             url or "",
         )
 
-        # Hvis r2_key finnes, ikke re-upload
         if existing["r2_key"]:
             row = await db_one(
                 """
@@ -357,9 +455,10 @@ async def extract_work(
     except Exception:
         raise HTTPException(status_code=422, detail="job_id must be a UUID string")
 
+    # Acquire a per-job advisory lock for the whole /work call.
+    # This prevents parallel /work calls on the same job.
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 1) Advisory lock per job: hindrer parallel /work på samme jobb
         locked = await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", str(job_uuid))
         if not locked:
             raise HTTPException(status_code=409, detail="Job is currently being processed (lock busy)")
@@ -387,7 +486,6 @@ async def extract_work(
                     "next_page": job["next_page"],
                 }
 
-            # Mark running
             if job["status"] in ("queued", "failed"):
                 await conn.execute(
                     """
@@ -402,75 +500,22 @@ async def extract_work(
                     job_uuid
                 )
 
-        finally:
-            # Ikke unlock her – vi vil holde låsen gjennom hele batch-arbeidet
-            pass
-
-    # 2) Last ned PDF til temp
-    tmp_dir = Path(tempfile.gettempdir())
-    fd, pdf_path = tempfile.mkstemp(prefix=f"job_{job_id}_", suffix=".pdf", dir=str(tmp_dir))
-    os.close(fd)
-
-    try:
-        # Vi bruker job fra DB på nytt i transaksjon senere; men trenger r2_key nå
-        job_row = await db_one(
-            "SELECT r2_key, next_page, num_pages, inserted_pages, status FROM public.pdf_extract_jobs WHERE job_id=$1",
-            job_uuid
-        )
-        await asyncio.to_thread(download_file_from_r2, job_row["r2_key"], pdf_path)
-
-        pdf = pdfium.PdfDocument(pdf_path)
-        try:
-            num_pages = len(pdf)
-        except Exception:
-            # Hvis pdfium feiler å lese lengde, marker fail
-            await set_error(job_uuid, "Failed to read PDF page count")
-            raise HTTPException(status_code=500, detail="Failed to read PDF page count")
-
-        # start/end
-        start_page = int(job_row["next_page"] or 1)
-        if start_page < 1:
-            start_page = 1
-
-        if start_page > num_pages:
-            # Alt bør allerede være gjort
-            await db_exec(
-                """
-                UPDATE public.pdf_extract_jobs
-                SET status='done',
-                    num_pages=COALESCE(num_pages, $2),
-                    completed_at=COALESCE(completed_at, now()),
-                    updated_at=now()
-                WHERE job_id=$1
-                """,
-                job_uuid, num_pages
-            )
-            return {
-                "job_id": job_id,
-                "status": "done",
-                "num_pages": num_pages,
-                "inserted_pages": job_row["inserted_pages"],
-                "next_page": start_page,
-                "batch_start": start_page,
-                "batch_end": start_page - 1,
-                "batch_processed": 0,
-                "batch_inserted": 0,
-            }
-
-        end_page = min(start_page + int(max_pages) - 1, num_pages)
-
-        processed = 0
-        inserted = 0
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Hold DB-lås gjennom inserts + updates
-            locked = await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", str(job_uuid))
-            if not locked:
-                raise HTTPException(status_code=409, detail="Job is currently being processed (lock busy)")
+            # Download PDF to temp (outside DB, but we keep advisory lock through whole function)
+            tmp_dir = Path(tempfile.gettempdir())
+            fd, pdf_path = tempfile.mkstemp(prefix=f"job_{job_id}_", suffix=".pdf", dir=str(tmp_dir))
+            os.close(fd)
 
             try:
-                # Sett num_pages hvis mangler
+                await asyncio.to_thread(download_file_from_r2, job["r2_key"], pdf_path)
+
+                pdf = pdfium.PdfDocument(pdf_path)
+                try:
+                    num_pages = len(pdf)
+                except Exception:
+                    await set_error(job_uuid, "Failed to read PDF page count")
+                    raise HTTPException(status_code=500, detail="Failed to read PDF page count")
+
+                # Save num_pages once
                 await conn.execute(
                     """
                     UPDATE public.pdf_extract_jobs
@@ -481,6 +526,39 @@ async def extract_work(
                     job_uuid, num_pages
                 )
 
+                start_page = int(job["next_page"] or 1)
+                if start_page < 1:
+                    start_page = 1
+
+                if start_page > num_pages:
+                    # nothing left; mark done
+                    await conn.execute(
+                        """
+                        UPDATE public.pdf_extract_jobs
+                        SET status='done',
+                            completed_at=COALESCE(completed_at, now()),
+                            updated_at=now()
+                        WHERE job_id=$1
+                        """,
+                        job_uuid
+                    )
+                    return {
+                        "job_id": job_id,
+                        "status": "done",
+                        "num_pages": num_pages,
+                        "inserted_pages": int(job["inserted_pages"] or 0),
+                        "next_page": start_page,
+                        "batch_start": start_page,
+                        "batch_end": start_page - 1,
+                        "batch_processed": 0,
+                        "batch_inserted": 0,
+                    }
+
+                end_page = min(start_page + int(max_pages) - 1, num_pages)
+
+                processed = 0
+                inserted = 0
+
                 for page_no in range(start_page, end_page + 1):
                     page = pdf.get_page(page_no - 1)
                     textpage = page.get_textpage()
@@ -488,7 +566,6 @@ async def extract_work(
                     textpage.close()
                     page.close()
 
-                    # Insert (resume-safe) og tell om den faktisk ble satt inn
                     r = await conn.fetchrow(
                         """
                         INSERT INTO public.pdf_extract_pages (job_id, pdf_page, text)
@@ -503,6 +580,10 @@ async def extract_work(
 
                     processed += 1
 
+                    if processed % 10 == 0:
+                        await asyncio.sleep(0)
+
+                    # Periodic heartbeat/progress
                     if processed % PROGRESS_EVERY_PAGES == 0:
                         await conn.execute(
                             """
@@ -513,12 +594,9 @@ async def extract_work(
                             """,
                             job_uuid, inserted
                         )
-                        inserted = 0  # “flush” delsum
+                        inserted = 0
 
-                    if processed % 10 == 0:
-                        await asyncio.sleep(0)
-
-                # flush siste delsum
+                # flush remainder
                 if inserted:
                     await conn.execute(
                         """
@@ -530,7 +608,6 @@ async def extract_work(
                         job_uuid, inserted
                     )
 
-                # Hent oppdatert teller og avgjør status
                 final = await conn.fetchrow(
                     "SELECT inserted_pages, num_pages FROM public.pdf_extract_jobs WHERE job_id=$1",
                     job_uuid
@@ -566,17 +643,19 @@ async def extract_work(
                     "next_page": new_next_page,
                 }
 
+            except HTTPException:
+                raise
             except Exception as e:
                 await set_error(job_uuid, str(e))
                 raise HTTPException(status_code=500, detail=str(e))
             finally:
                 try:
-                    await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", str(job_uuid))
+                    os.remove(pdf_path)
                 except Exception:
                     pass
 
-    finally:
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
+        finally:
+            try:
+                await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", str(job_uuid))
+            except Exception:
+                pass
